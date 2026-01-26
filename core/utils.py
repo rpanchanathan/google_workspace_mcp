@@ -1,6 +1,7 @@
 import io
 import logging
 import os
+import random
 import re
 import zipfile
 import xml.etree.ElementTree as ET
@@ -316,6 +317,31 @@ def handle_http_errors(
                 except HttpError as error:
                     user_google_email = kwargs.get("user_google_email", "N/A")
                     error_details = str(error)
+
+                    # Check for rate limit (429) - retry with backoff
+                    if error.resp.status == 429 and attempt < max_retries - 1:
+                        retry_after = error.resp.headers.get('Retry-After', None)
+                        if retry_after:
+                            try:
+                                wait_time = int(retry_after)
+                            except ValueError:
+                                wait_time = (2 ** attempt) + random.uniform(0, 1)
+                        else:
+                            wait_time = (2 ** attempt) + random.uniform(0, 1)
+                        logger.warning(
+                            f"Rate limited (429) in {tool_name}. Waiting {wait_time:.1f}s before retry {attempt + 1}/{max_retries}"
+                        )
+                        await asyncio.sleep(wait_time)
+                        continue
+                    elif error.resp.status == 429:
+                        # Final attempt failed with rate limit
+                        logger.error(
+                            f"Rate limit (429) in {tool_name} after {max_retries} attempts"
+                        )
+                        raise TransientNetworkError(
+                            f"Rate limit exceeded in '{tool_name}' after {max_retries} attempts. "
+                            "Please try again later."
+                        ) from error
 
                     # Check if this is an API not enabled error
                     if (

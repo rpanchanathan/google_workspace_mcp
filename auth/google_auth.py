@@ -37,6 +37,9 @@ logger = logging.getLogger(__name__)
 
 
 # Constants
+GOOGLE_API_TIMEOUT = int(os.environ.get('GOOGLE_API_TIMEOUT', '60'))
+
+
 def get_default_credentials_dir():
     """Get the default credentials directory path, preferring user-specific locations.
 
@@ -934,7 +937,18 @@ async def get_authenticated_google_service(
         raise GoogleAuthenticationError(auth_response)
 
     try:
-        service = build(service_name, version, credentials=credentials)
+        # Wrap service build with timeout
+        try:
+            service = await asyncio.wait_for(
+                asyncio.to_thread(build, service_name, version, credentials=credentials),
+                timeout=GOOGLE_API_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            from core.utils import TransientNetworkError
+            raise TransientNetworkError(
+                f"Google API service build timed out after {GOOGLE_API_TIMEOUT}s for {service_name}"
+            )
+
         log_user_email = user_google_email
 
         # Try to get email from credentials if needed for validation
@@ -956,6 +970,11 @@ async def get_authenticated_google_service(
         )
         return service, log_user_email
 
+    except asyncio.TimeoutError:
+        from core.utils import TransientNetworkError
+        raise TransientNetworkError(
+            f"Google API service build timed out after {GOOGLE_API_TIMEOUT}s for {service_name}"
+        )
     except Exception as e:
         error_msg = f"[{tool_name}] Failed to build {service_name} service: {str(e)}"
         logger.error(error_msg, exc_info=True)
