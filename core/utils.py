@@ -1,19 +1,44 @@
 import io
 import logging
 import os
+import re
 import zipfile
 import xml.etree.ElementTree as ET
 import ssl
 import asyncio
 import functools
 
-from typing import List, Optional
+from typing import List, Optional, Any, Dict
 
 from googleapiclient.errors import HttpError
 from .api_enablement import get_api_enablement_message
 from auth.google_auth import GoogleAuthenticationError
 
 logger = logging.getLogger(__name__)
+
+
+def redact_sensitive_data(data: Any) -> Any:
+    """Redact sensitive fields from data before logging.
+
+    Args:
+        data: Data to redact (dict, string, or other type)
+
+    Returns:
+        Redacted data with sensitive values replaced
+    """
+    if isinstance(data, dict):
+        sensitive_keys = {'refresh_token', 'access_token', 'client_secret', 'token', 'id_token'}
+        return {
+            k: '***REDACTED***' if k in sensitive_keys else redact_sensitive_data(v)
+            for k, v in data.items()
+        }
+    elif isinstance(data, str):
+        # Redact anything that looks like a Google access token (ya29.*)
+        data = re.sub(r'(ya29\.[A-Za-z0-9_-]{50,})', '***ACCESS_TOKEN_REDACTED***', data)
+        # Redact anything that looks like a refresh token (long base64-ish strings)
+        data = re.sub(r'(1//[A-Za-z0-9_-]{50,})', '***REFRESH_TOKEN_REDACTED***', data)
+        return data
+    return data
 
 
 class TransientNetworkError(Exception):

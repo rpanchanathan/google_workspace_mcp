@@ -91,6 +91,24 @@ else:
 # --- Helper Functions ---
 
 
+def _is_token_expiring_soon(credentials, buffer_seconds=300):
+    """Check if token expires within buffer_seconds.
+
+    Args:
+        credentials: Google Credentials object
+        buffer_seconds: Time buffer in seconds (default: 300 = 5 minutes)
+
+    Returns:
+        True if token expires within buffer_seconds, False otherwise
+    """
+    if not credentials.expiry:
+        return True  # No expiry info, assume needs refresh
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    expiry = credentials.expiry.replace(tzinfo=timezone.utc) if credentials.expiry.tzinfo is None else credentials.expiry
+    return (expiry - now).total_seconds() < buffer_seconds
+
+
 def _find_any_credentials(
     base_dir: str = DEFAULT_CREDENTIALS_DIR,
 ) -> Optional[Credentials]:
@@ -583,8 +601,8 @@ def get_credentials(
                     )
                     return None
 
-                # Return if valid
-                if credentials.valid:
+                # Return if valid and not expiring soon
+                if credentials.valid and not _is_token_expiring_soon(credentials):
                     return credentials
                 elif credentials.expired and credentials.refresh_token:
                     # Try to refresh
@@ -699,12 +717,12 @@ def get_credentials(
         f"[get_credentials] Credentials have sufficient scopes. User: '{user_google_email}', Session: '{session_id}'"
     )
 
-    if credentials.valid:
+    if credentials.valid and not _is_token_expiring_soon(credentials):
         logger.debug(
-            f"[get_credentials] Credentials are valid. User: '{user_google_email}', Session: '{session_id}'"
+            f"[get_credentials] Credentials are valid and not expiring soon. User: '{user_google_email}', Session: '{session_id}'"
         )
         return credentials
-    elif credentials.expired and credentials.refresh_token:
+    elif (credentials.expired or _is_token_expiring_soon(credentials)) and credentials.refresh_token:
         logger.info(
             f"[get_credentials] Credentials expired. Attempting refresh. User: '{user_google_email}', Session: '{session_id}'"
         )
