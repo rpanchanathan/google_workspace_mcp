@@ -1759,7 +1759,7 @@ async def batch_modify_gmail_message_labels(
     return f"Labels updated for {len(message_ids)} messages: {'; '.join(actions)}"
 
 
-@server.call_tool()
+@server.tool()
 @handle_http_errors("batch_delete_messages", is_read_only=False, service_type="gmail")
 @require_google_service("gmail", "gmail_modify")
 async def batch_delete_messages(

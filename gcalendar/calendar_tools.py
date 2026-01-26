@@ -1073,3 +1073,175 @@ async def delete_event(
     confirmation_message = f"Successfully deleted event (ID: {event_id}) from calendar '{calendar_id}' for {user_google_email}."
     logger.info(f"Event deleted successfully for {user_google_email}. ID: {event_id}")
     return confirmation_message
+
+
+@server.tool()
+@handle_http_errors("batch_create_events", service_type="calendar")
+@require_google_service("calendar", "calendar_events")
+async def batch_create_events(
+    service,
+    user_google_email: str,
+    calendar_id: str,
+    events: Union[str, List[Dict[str, Any]]],
+) -> str:
+    """
+    Create multiple calendar events in batch.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        calendar_id (str): Calendar ID (use 'primary' for main calendar). Required.
+        events (Union[str, List[Dict]]): List of event objects (max 50), each containing:
+            - summary (str): Event title
+            - start (dict): Start time with dateTime and timeZone
+            - end (dict): End time with dateTime and timeZone
+            - description (str, optional): Event description
+            - location (str, optional): Event location
+            - attendees (list, optional): List of attendee emails
+
+    Returns:
+        str: Summary of created events with their IDs.
+
+    Example:
+        events = [
+            {
+                "summary": "Team Meeting",
+                "start": {"dateTime": "2026-01-27T10:00:00", "timeZone": "America/Los_Angeles"},
+                "end": {"dateTime": "2026-01-27T11:00:00", "timeZone": "America/Los_Angeles"}
+            }
+        ]
+    """
+    logger.info(
+        f"[batch_create_events] Email: '{user_google_email}', "
+        f"Calendar: {calendar_id}, Event count: {len(events) if isinstance(events, list) else 'unknown'}"
+    )
+
+    # Parse events if JSON string
+    if isinstance(events, str):
+        try:
+            events = json.loads(events)
+        except json.JSONDecodeError as e:
+            return f"Error: Invalid JSON format for events: {e}"
+
+    if not isinstance(events, list):
+        return f"Error: Events must be a list, got {type(events).__name__}"
+
+    if len(events) > 50:
+        return "Error: Maximum 50 events per batch operation"
+
+    if not events:
+        return "No events to create"
+
+    results = []
+    for i, event_data in enumerate(events):
+        try:
+            created_event = await asyncio.to_thread(
+                service.events()
+                .insert(calendarId=calendar_id, body=event_data)
+                .execute
+            )
+
+            results.append({
+                "index": i,
+                "event_id": created_event["id"],
+                "summary": created_event.get("summary", "Untitled"),
+                "start": created_event["start"].get("dateTime", created_event["start"].get("date")),
+                "html_link": created_event.get("htmlLink", "")
+            })
+
+        except Exception as e:
+            results.append({
+                "index": i,
+                "error": str(e),
+                "summary": event_data.get("summary", "Unknown")
+            })
+
+    # Format output
+    success_count = sum(1 for r in results if "event_id" in r)
+    error_count = len(results) - success_count
+
+    output_lines = [
+        f"Batch event creation complete: {success_count} created, {error_count} failed\n"
+    ]
+
+    for result in results:
+        if "error" in result:
+            output_lines.append(
+                f"\n❌ Event {result['index']}: '{result['summary']}' - Error: {result['error']}"
+            )
+        else:
+            output_lines.append(
+                f"\n✓ Event {result['index']}: '{result['summary']}'\n"
+                f"  ID: {result['event_id']}\n"
+                f"  Start: {result['start']}\n"
+                f"  Link: {result['html_link']}"
+            )
+
+    return "".join(output_lines)
+
+
+@server.tool()
+@handle_http_errors("batch_delete_events", service_type="calendar")
+@require_google_service("calendar", "calendar_events")
+async def batch_delete_events(
+    service,
+    user_google_email: str,
+    calendar_id: str,
+    event_ids: List[str],
+) -> str:
+    """
+    Delete multiple calendar events in batch.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        calendar_id (str): Calendar ID (use 'primary' for main calendar). Required.
+        event_ids (List[str]): List of event IDs to delete (max 50).
+
+    Returns:
+        str: Summary of deleted events.
+    """
+    logger.info(
+        f"[batch_delete_events] Email: '{user_google_email}', "
+        f"Calendar: {calendar_id}, Event count: {len(event_ids)}"
+    )
+
+    if len(event_ids) > 50:
+        return "Error: Maximum 50 events per batch delete operation"
+
+    if not event_ids:
+        return "No events to delete"
+
+    results = []
+    for event_id in event_ids:
+        try:
+            await asyncio.to_thread(
+                service.events()
+                .delete(calendarId=calendar_id, eventId=event_id)
+                .execute
+            )
+            results.append({"event_id": event_id, "status": "deleted"})
+
+        except HttpError as e:
+            if e.resp.status == 404:
+                results.append({"event_id": event_id, "error": "Not found"})
+            else:
+                results.append({"event_id": event_id, "error": str(e)})
+        except Exception as e:
+            results.append({"event_id": event_id, "error": str(e)})
+
+    # Format output
+    success_count = sum(1 for r in results if r.get("status") == "deleted")
+    error_count = len(results) - success_count
+
+    output_lines = [
+        f"Batch event deletion complete: {success_count} deleted, {error_count} failed\n"
+    ]
+
+    for result in results:
+        if "error" in result:
+            output_lines.append(
+                f"\n❌ Event {result['event_id']}: {result['error']}"
+            )
+        else:
+            output_lines.append(f"\n✓ Event {result['event_id']}: Deleted")
+
+    return "".join(output_lines)

@@ -1328,6 +1328,94 @@ async def export_doc_to_pdf(
         return f"Error: Failed to upload PDF to Drive: {str(e)}. PDF was generated successfully ({pdf_size:,} bytes) but could not be saved to Drive."
 
 
+@server.tool()
+@handle_http_errors("batch_read_docs", is_read_only=True, service_type="docs")
+@require_multiple_services([
+    {"service_type": "docs", "scopes": "docs_read", "param_name": "docs_service"},
+    {"service_type": "drive", "scopes": "drive_read", "param_name": "drive_service"}
+])
+async def batch_read_docs(
+    docs_service: Any,
+    drive_service: Any,
+    user_google_email: str,
+    document_ids: List[str],
+) -> str:
+    """
+    Read content from multiple Google Docs in batch.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        document_ids (List[str]): List of document IDs to read (max 20).
+
+    Returns:
+        str: Combined content from all documents with metadata.
+    """
+    logger.info(
+        f"[batch_read_docs] Email: '{user_google_email}', "
+        f"Document count: {len(document_ids)}"
+    )
+
+    if len(document_ids) > 20:
+        return "Error: Maximum 20 documents per batch read operation"
+
+    if not document_ids:
+        return "No documents to read"
+
+    results = []
+    for doc_id in document_ids:
+        try:
+            # Get document content
+            doc = await asyncio.to_thread(
+                docs_service.documents().get(documentId=doc_id).execute
+            )
+
+            title = doc.get("title", "Untitled")
+            body = doc.get("body", {})
+            content = body.get("content", [])
+
+            # Extract text content
+            text_parts = []
+            for element in content:
+                if "paragraph" in element:
+                    paragraph = element["paragraph"]
+                    for text_run in paragraph.get("elements", []):
+                        if "textRun" in text_run:
+                            text_parts.append(text_run["textRun"].get("content", ""))
+
+            text_content = "".join(text_parts).strip()
+
+            results.append({
+                "document_id": doc_id,
+                "title": title,
+                "content": text_content[:5000],  # Limit to 5000 chars per doc
+                "total_length": len(text_content),
+                "truncated": len(text_content) > 5000
+            })
+
+        except Exception as e:
+            results.append({
+                "document_id": doc_id,
+                "error": str(e)
+            })
+
+    # Format output
+    output_lines = [f"Successfully read {len(results)} documents:\n"]
+    for result in results:
+        if "error" in result:
+            output_lines.append(
+                f"\n❌ Document {result['document_id']}: Error - {result['error']}"
+            )
+        else:
+            truncated_note = " (truncated)" if result["truncated"] else ""
+            output_lines.append(
+                f"\n✓ {result['title']} (ID: {result['document_id']})\n"
+                f"  Length: {result['total_length']:,} chars{truncated_note}\n"
+                f"  Content:\n{result['content']}\n"
+            )
+
+    return "".join(output_lines)
+
+
 # Create comment management tools for documents
 _comment_tools = create_comment_tools("document", "document_id")
 

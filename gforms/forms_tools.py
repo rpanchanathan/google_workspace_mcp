@@ -6,7 +6,7 @@ This module provides MCP tools for interacting with Google Forms API.
 
 import logging
 import asyncio
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 
 from auth.service_decorator import require_google_service
@@ -283,3 +283,94 @@ async def list_form_responses(
         f"Successfully retrieved {len(responses)} responses for {user_google_email}. Form ID: {form_id}"
     )
     return result
+
+
+@server.tool()
+@handle_http_errors("batch_get_form_responses", is_read_only=True, service_type="forms")
+@require_google_service("forms", "forms_responses_read")
+async def batch_get_form_responses(
+    service,
+    user_google_email: str,
+    form_ids: List[str],
+    max_responses_per_form: int = 10,
+) -> str:
+    """
+    Get responses from multiple Google Forms in batch.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        form_ids (List[str]): List of form IDs to retrieve responses from (max 10).
+        max_responses_per_form (int): Maximum responses to retrieve per form (default 10).
+
+    Returns:
+        str: Summary of responses from all forms.
+    """
+    logger.info(
+        f"[batch_get_form_responses] Email: '{user_google_email}', "
+        f"Form count: {len(form_ids)}, Max per form: {max_responses_per_form}"
+    )
+
+    if len(form_ids) > 10:
+        return "Error: Maximum 10 forms per batch operation"
+
+    if not form_ids:
+        return "No forms to retrieve responses from"
+
+    results = []
+    for form_id in form_ids:
+        try:
+            # Get form metadata
+            form = await asyncio.to_thread(
+                service.forms().get(formId=form_id).execute
+            )
+
+            form_title = form.get("info", {}).get("title", "Untitled Form")
+
+            # Get responses
+            response_list = await asyncio.to_thread(
+                service.forms()
+                .responses()
+                .list(formId=form_id, pageSize=max_responses_per_form)
+                .execute
+            )
+
+            responses = response_list.get("responses", [])
+
+            results.append({
+                "form_id": form_id,
+                "title": form_title,
+                "response_count": len(responses),
+                "responses": responses[:max_responses_per_form]
+            })
+
+        except Exception as e:
+            results.append({
+                "form_id": form_id,
+                "error": str(e)
+            })
+
+    # Format output
+    output_lines = [f"Retrieved responses from {len(results)} forms:\n"]
+
+    for result in results:
+        if "error" in result:
+            output_lines.append(
+                f"\n❌ Form {result['form_id']}: Error - {result['error']}"
+            )
+        else:
+            output_lines.append(
+                f"\n✓ {result['title']} (ID: {result['form_id']})\n"
+                f"  Total responses: {result['response_count']}\n"
+            )
+
+            for i, response in enumerate(result.get("responses", []), 1):
+                response_id = response.get("responseId", "Unknown")
+                create_time = response.get("createTime", "Unknown")
+                answers_count = len(response.get("answers", {}))
+
+                output_lines.append(
+                    f"  {i}. Response ID: {response_id} | "
+                    f"Created: {create_time} | Answers: {answers_count}\n"
+                )
+
+    return "".join(output_lines)

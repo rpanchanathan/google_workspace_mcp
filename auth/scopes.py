@@ -229,6 +229,7 @@ SCOPE_GROUPS = {
     "chat_write": CHAT_WRITE_SCOPE,
     "chat_spaces": CHAT_SPACES_SCOPE,
     # Forms scopes
+    "forms": FORMS_BODY_SCOPE,  # Default forms scope
     "forms_body": FORMS_BODY_SCOPE,
     "forms_body_read": FORMS_BODY_READONLY_SCOPE,
     "forms_responses_read": FORMS_RESPONSES_READONLY_SCOPE,
