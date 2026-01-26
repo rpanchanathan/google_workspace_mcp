@@ -1757,3 +1757,61 @@ async def batch_modify_gmail_message_labels(
         actions.append(f"Removed labels: {', '.join(remove_label_ids)}")
 
     return f"Labels updated for {len(message_ids)} messages: {'; '.join(actions)}"
+
+
+@server.call_tool()
+@handle_http_errors("batch_delete_messages", is_read_only=False, service_type="gmail")
+@require_google_service("gmail", "gmail_modify")
+async def batch_delete_messages(
+    service,
+    user_google_email: str,
+    message_ids: List[str],
+    permanent: bool = Field(
+        default=False,
+        description="If True, permanently delete messages. If False, move to trash."
+    ),
+) -> str:
+    """
+    Delete multiple Gmail messages in batch.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        message_ids (List[str]): List of message IDs to delete (max 100).
+        permanent (bool): If True, permanently delete. If False, move to trash. Default: False.
+
+    Returns:
+        str: Confirmation message with deletion details.
+
+    Raises:
+        Exception: If message_ids list exceeds 100 messages or deletion fails.
+    """
+    logger.info(
+        f"[batch_delete_messages] Invoked. Email: '{user_google_email}', "
+        f"Message count: {len(message_ids)}, Permanent: {permanent}"
+    )
+
+    if len(message_ids) > 100:
+        raise Exception("Maximum 100 messages per batch delete operation")
+
+    if not message_ids:
+        return "No messages to delete"
+
+    if permanent:
+        # Use batchDelete for permanent deletion
+        body = {'ids': message_ids}
+        await asyncio.to_thread(
+            service.users().messages().batchDelete(userId='me', body=body).execute
+        )
+        action = "permanently deleted"
+    else:
+        # Use batchModify to add TRASH label
+        body = {
+            'ids': message_ids,
+            'addLabelIds': ['TRASH']
+        }
+        await asyncio.to_thread(
+            service.users().messages().batchModify(userId='me', body=body).execute
+        )
+        action = "moved to trash"
+
+    return f"Successfully {action} {len(message_ids)} messages"

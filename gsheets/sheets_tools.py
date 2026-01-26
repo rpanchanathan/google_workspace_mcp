@@ -366,6 +366,96 @@ async def modify_sheet_values(
 
 
 @server.tool()
+@handle_http_errors("batch_update_cells", service_type="sheets")
+@require_google_service("sheets", "sheets_write")
+async def batch_update_cells(
+    service,
+    user_google_email: str,
+    spreadsheet_id: str,
+    updates: Union[str, List[dict]],
+) -> str:
+    """
+    Update multiple ranges in a spreadsheet in one API call.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        spreadsheet_id (str): The ID of the spreadsheet. Required.
+        updates (Union[str, List[dict]]): List of update objects, each containing:
+            - range (str): The A1 notation range (e.g., "Sheet1!A1:B2")
+            - values (List[List[str]]): 2D array of values to write
+            Can be a JSON string or Python list.
+
+    Returns:
+        str: Confirmation message with updated cell counts.
+
+    Example:
+        updates = [
+            {"range": "Sheet1!A1:B2", "values": [["Name", "Age"], ["John", "30"]]},
+            {"range": "Sheet1!D1:E1", "values": [["City", "Country"]]}
+        ]
+    """
+    logger.info(
+        f"[batch_update_cells] Invoked. Email: '{user_google_email}', "
+        f"Spreadsheet: {spreadsheet_id}, Update count: {len(updates) if isinstance(updates, list) else 'unknown'}"
+    )
+
+    # Parse updates if it's a JSON string
+    if isinstance(updates, str):
+        try:
+            updates = json.loads(updates)
+            if not isinstance(updates, list):
+                raise ValueError(f"Updates must be a list, got {type(updates).__name__}")
+        except json.JSONDecodeError as e:
+            raise UserInputError(f"Invalid JSON format for updates: {e}")
+        except ValueError as e:
+            raise UserInputError(f"Invalid updates structure: {e}")
+
+    if not updates:
+        raise UserInputError("At least one update must be provided")
+
+    # Validate update structure
+    for i, update in enumerate(updates):
+        if not isinstance(update, dict):
+            raise UserInputError(f"Update {i} must be a dictionary")
+        if "range" not in update:
+            raise UserInputError(f"Update {i} missing required 'range' field")
+        if "values" not in update:
+            raise UserInputError(f"Update {i} missing required 'values' field")
+        if not isinstance(update["values"], list):
+            raise UserInputError(f"Update {i} 'values' must be a list")
+
+    # Build batch update request
+    body = {
+        'valueInputOption': 'USER_ENTERED',
+        'data': [
+            {'range': update['range'], 'values': update['values']}
+            for update in updates
+        ]
+    }
+
+    result = await asyncio.to_thread(
+        service.spreadsheets()
+        .values()
+        .batchUpdate(spreadsheetId=spreadsheet_id, body=body)
+        .execute
+    )
+
+    total_updated_cells = result.get('totalUpdatedCells', 0)
+    total_updated_rows = result.get('totalUpdatedRows', 0)
+    updated_ranges = len(updates)
+
+    logger.info(
+        f"[batch_update_cells] Successfully updated {total_updated_cells} cells "
+        f"across {updated_ranges} ranges for {user_google_email}"
+    )
+
+    return (
+        f"Successfully updated {total_updated_cells} cells in {updated_ranges} ranges "
+        f"({total_updated_rows} rows) in spreadsheet {spreadsheet_id}"
+    )
+
+
+@server.tool()
 @handle_http_errors("format_sheet_range", service_type="sheets")
 @require_google_service("sheets", "sheets_write")
 async def format_sheet_range(
