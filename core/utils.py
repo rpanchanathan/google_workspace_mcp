@@ -9,6 +9,7 @@ import ssl
 import asyncio
 import functools
 
+from pathlib import Path
 from typing import List, Optional, Any, Dict
 
 from googleapiclient.errors import HttpError
@@ -16,6 +17,153 @@ from .api_enablement import get_api_enablement_message
 from auth.google_auth import GoogleAuthenticationError
 
 logger = logging.getLogger(__name__)
+
+# Number of retries for Google API write calls (upload/create).
+GOOGLE_API_WRITE_RETRIES = 3
+
+
+# Override via ALLOWED_FILE_DIRS env var (os.pathsep-separated paths).
+_ALLOWED_FILE_DIRS_ENV = "ALLOWED_FILE_DIRS"
+
+
+def _get_allowed_file_dirs() -> list[Path]:
+    """Return the list of directories from which local file access is permitted."""
+    from core.attachment_storage import STORAGE_DIR
+
+    allowed_dirs: list[Path] = [STORAGE_DIR]
+    env_val = os.environ.get(_ALLOWED_FILE_DIRS_ENV)
+    if env_val:
+        allowed_dirs.extend(
+            Path(p_stripped).expanduser().resolve()
+            for p in env_val.split(os.pathsep)
+            if (p_stripped := p.strip())
+        )
+
+    unique_dirs: list[Path] = []
+    seen: set[Path] = set()
+    for path in allowed_dirs:
+        if path in seen:
+            continue
+        seen.add(path)
+        unique_dirs.append(path)
+    return unique_dirs
+
+
+def validate_file_path(file_path: str) -> Path:
+    """
+    Validate that a file path is safe to read from the server filesystem.
+
+    Resolves the path canonically (following symlinks), then verifies it falls
+    within one of the allowed base directories. Rejects paths to sensitive
+    system locations regardless of allowlist.
+
+    Args:
+        file_path: The raw file path string to validate.
+
+    Returns:
+        Path: The resolved, validated Path object.
+
+    Raises:
+        ValueError: If the path is outside allowed directories or targets
+                    a sensitive location.
+    """
+    resolved = Path(file_path).resolve()
+
+    if not resolved.exists():
+        raise FileNotFoundError(f"Path does not exist: {resolved}")
+
+    # Block sensitive file patterns regardless of allowlist
+    resolved_str = str(resolved)
+    file_name = resolved.name.lower()
+
+    path_parts = [part.lower() for part in resolved.parts]
+
+    # Block .env files and variants (.env, .env.local, .env.production, etc.)
+    if any(part == ".env" or part.startswith(".env.") for part in path_parts):
+        raise ValueError(
+            f"Access to '{resolved_str}' is not allowed: "
+            ".env files may contain secrets and cannot be read, uploaded, or attached."
+        )
+
+    # Block well-known sensitive system paths (including macOS /private variants)
+    sensitive_prefixes = (
+        "/proc",
+        "/sys",
+        "/dev",
+        "/etc/shadow",
+        "/etc/passwd",
+        "/private/etc/shadow",
+        "/private/etc/passwd",
+    )
+    for prefix in sensitive_prefixes:
+        if resolved_str == prefix or resolved_str.startswith(prefix + "/"):
+            raise ValueError(
+                f"Access to '{resolved_str}' is not allowed: "
+                "path is in a restricted system location."
+            )
+
+    # Block sensitive directories that commonly contain credentials/keys.
+    if ".ssh" in path_parts or ".aws" in path_parts:
+        raise ValueError(
+            f"Access to '{resolved_str}' is not allowed: "
+            "path is in a directory that commonly contains secrets or credentials."
+        )
+
+    home = Path.home()
+    sensitive_home_dirs = (
+        ".kube",
+        ".gnupg",
+        ".config/gcloud",
+    )
+    for sensitive_dir in sensitive_home_dirs:
+        blocked = home / sensitive_dir
+        if resolved == blocked or str(resolved).startswith(str(blocked) + "/"):
+            raise ValueError(
+                f"Access to '{resolved_str}' is not allowed: "
+                "path is in a directory that commonly contains secrets or credentials."
+            )
+
+    # Block other credential/secret file patterns
+    sensitive_names = {
+        ".credentials",
+        ".credentials.json",
+        "credentials.json",
+        "client_secret.json",
+        "client_secrets.json",
+        "service_account.json",
+        "service-account.json",
+        ".npmrc",
+        ".pypirc",
+        ".netrc",
+        ".git-credentials",
+        ".docker/config.json",
+    }
+    if file_name in sensitive_names:
+        raise ValueError(
+            f"Access to '{resolved_str}' is not allowed: "
+            "this file commonly contains secrets or credentials."
+        )
+
+    allowed_dirs = _get_allowed_file_dirs()
+    if not allowed_dirs:
+        raise ValueError(
+            "No allowed file directories configured. "
+            "Set the ALLOWED_FILE_DIRS environment variable or configure "
+            "WORKSPACE_ATTACHMENT_DIR."
+        )
+
+    for allowed in allowed_dirs:
+        try:
+            resolved.relative_to(allowed)
+            return resolved
+        except ValueError:
+            continue
+
+    raise ValueError(
+        f"Access to '{resolved_str}' is not allowed: "
+        f"path is outside permitted directories ({', '.join(str(d) for d in allowed_dirs)}). "
+        "Set ALLOWED_FILE_DIRS to adjust."
+    )
 
 
 def redact_sensitive_data(data: Any) -> Any:

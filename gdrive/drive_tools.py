@@ -22,11 +22,22 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from auth.service_decorator import require_google_service
 from auth.oauth_config import is_stateless_mode
 from core.attachment_storage import get_attachment_storage, get_attachment_url
-from core.utils import extract_office_xml_text, handle_http_errors
+from core.utils import (
+    extract_office_xml_text,
+    handle_http_errors,
+    GOOGLE_API_WRITE_RETRIES,
+)
 from core.server import server
 from core.config import get_transport_mode
 from gdrive.drive_helpers import (
     DRIVE_QUERY_PATTERNS,
+    GOOGLE_DOCS_IMPORT_FORMATS,
+    GOOGLE_DOCS_MIME_TYPE,
+    GOOGLE_SHEETS_IMPORT_FORMATS,
+    GOOGLE_SHEETS_MIME_TYPE,
+    GOOGLE_SLIDES_IMPORT_FORMATS,
+    GOOGLE_SLIDES_MIME_TYPE,
+    _resolve_import_media,
     build_drive_list_params,
     check_public_link_permission,
     format_permission_info,
@@ -1605,3 +1616,285 @@ async def transfer_drive_ownership(
     output_parts.extend(["", "Note: Previous owner now has editor access."])
 
     return "\n".join(output_parts)
+async def _import_with_conversion(
+    service,
+    *,
+    tool_name: str,
+    target_label: str,
+    id_label: str,
+    target_mime_type: str,
+    format_map: Dict[str, str],
+    user_google_email: str,
+    file_name: str,
+    content: Optional[str],
+    file_path: Optional[str],
+    file_url: Optional[str],
+    source_format: Optional[str],
+    folder_id: str,
+) -> str:
+    """
+    Shared implementation for the import_to_google_* tools.
+
+    Uploads source bytes (from content, a local file, or a remote URL) as media
+    while ``body.mimeType`` is the Google Apps ``target_mime_type``, letting Drive
+    auto-convert the Office/OpenDocument/text source into native Google format.
+
+    Args:
+        tool_name: Logging prefix and the tool's registered name (for messages).
+        target_label: Human-readable destination name (e.g. "Google Doc").
+        id_label: Label for the created file's ID in the confirmation message.
+        target_mime_type: The ``application/vnd.google-apps.*`` destination type.
+        format_map: Extension -> source MIME type allowlist for this destination.
+    """
+    logger.info(
+        f"[{tool_name}] Invoked. Email: '{user_google_email}', "
+        f"File Name: '{file_name}', Source Format: '{source_format}', Folder ID: '{folder_id}'"
+    )
+
+    media, source_mime_type, remote_file_data = await _resolve_import_media(
+        tool_name=tool_name,
+        file_name=file_name,
+        content=content,
+        file_path=file_path,
+        file_url=file_url,
+        source_format=source_format,
+        format_map=format_map,
+    )
+
+    # Clean up file name (remove extension since it becomes a Google Apps file)
+    doc_name = Path(file_name).stem if Path(file_name).suffix else file_name
+
+    # Resolve folder
+    resolved_folder_id = await resolve_folder_id(service, folder_id)
+
+    # File metadata - destination is the Google Apps target format
+    file_metadata = {
+        "name": doc_name,
+        "parents": [resolved_folder_id],
+        "mimeType": target_mime_type,  # Target format = Google Apps type
+    }
+
+    # Upload with conversion
+    logger.info(
+        f"[{tool_name}] Uploading to Google Drive with conversion: "
+        f"{source_mime_type} → {target_mime_type}"
+    )
+    try:
+        created_file = await asyncio.to_thread(
+            service.files()
+            .create(
+                body=file_metadata,
+                media_body=media,
+                fields="id, name, webViewLink, mimeType",
+                supportsAllDrives=True,
+            )
+            .execute,
+            num_retries=GOOGLE_API_WRITE_RETRIES,
+        )
+    finally:
+        if remote_file_data is not None:
+            remote_file_data.close()
+
+    result_mime = created_file.get("mimeType", "unknown")
+    if result_mime != target_mime_type:
+        logger.warning(
+            f"[{tool_name}] Conversion may have failed. "
+            f"Expected {target_mime_type}, got {result_mime}"
+        )
+
+    link = created_file.get("webViewLink", "No link available")
+    doc_id = created_file.get("id", "N/A")
+
+    confirmation = (
+        f"✅ Successfully imported '{doc_name}' as {target_label}\n"
+        f"   {id_label}: {doc_id}\n"
+        f"   Source format: {source_mime_type}\n"
+        f"   Folder: {folder_id}\n"
+        f"   Link: {link}"
+    )
+
+    logger.info(f"[{tool_name}] Success. Link: {link}")
+    return confirmation
+
+
+@server.tool()
+@handle_http_errors("import_to_google_doc", service_type="drive")
+@require_google_service("drive", "drive_file")
+async def import_to_google_doc(
+    service,
+    user_google_email: str,
+    file_name: str,
+    content: Optional[str] = None,
+    file_path: Optional[str] = None,
+    file_url: Optional[str] = None,
+    source_format: Optional[str] = None,
+    folder_id: str = "root",
+) -> str:
+    """
+    Imports a file (Markdown, DOCX, TXT, HTML, RTF, ODT) into Google Docs format with automatic conversion.
+
+    Google Drive automatically converts the source file to native Google Docs format,
+    preserving formatting like headings, lists, bold, italic, etc.
+    For batch operations, prefer file_path for files on disk so callers do not need
+    to load full file contents into their context.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        file_name (str): The name for the new Google Doc (extension will be ignored).
+        content (Optional[str]): Text content for text-based formats. Use only for short snippets or content already in memory.
+        file_path (Optional[str]): Local file path or file:// URL for any supported format (MD, TXT, HTML, DOCX, ODT, RTF). Appropriate for larger files than content, but file_path may still load the file into memory or perform non-streaming reads. Avoid very large files that could exceed memory or time limits; use streaming/chunked uploads or an alternative API for huge files.
+        file_url (Optional[str]): Remote URL to fetch the file from (http/https).
+        source_format (Optional[str]): Source format hint ('md', 'markdown', 'docx', 'txt', 'html', 'rtf', 'odt').
+                                       Auto-detected from file_name extension if not provided.
+        folder_id (str): The ID of the parent folder. Defaults to 'root'.
+
+    Returns:
+        str: Confirmation message with the new Google Doc link.
+
+    Examples:
+        # Import a markdown file from disk (preferred for batch operations)
+        import_to_google_doc(file_name="My Doc.md", file_path="/path/to/my-doc.md", source_format="md")
+
+        # Import markdown content directly
+        import_to_google_doc(file_name="My Doc.md", content="# Title\\n\\nHello **world**")
+
+        # Import a local DOCX file
+        import_to_google_doc(file_name="Report", file_path="/path/to/report.docx")
+
+        # Import from URL
+        import_to_google_doc(file_name="Remote Doc", file_url="https://example.com/doc.md")
+    """
+    return await _import_with_conversion(
+        service,
+        tool_name="import_to_google_doc",
+        target_label="Google Doc",
+        id_label="Document ID",
+        target_mime_type=GOOGLE_DOCS_MIME_TYPE,
+        format_map=GOOGLE_DOCS_IMPORT_FORMATS,
+        user_google_email=user_google_email,
+        file_name=file_name,
+        content=content,
+        file_path=file_path,
+        file_url=file_url,
+        source_format=source_format,
+        folder_id=folder_id,
+    )
+
+
+@server.tool()
+@handle_http_errors("import_to_google_slides", service_type="drive")
+@require_google_service("drive", "drive_file")
+async def import_to_google_slides(
+    service,
+    user_google_email: str,
+    file_name: str,
+    file_path: Optional[str] = None,
+    file_url: Optional[str] = None,
+    source_format: Optional[str] = None,
+    folder_id: str = "root",
+) -> str:
+    """
+    Imports a presentation (PPTX, PPT, ODP) into Google Slides format with automatic conversion.
+
+    Google Drive automatically converts the source presentation to native Google Slides format,
+    preserving slides, layouts, text, and images.
+    For batch operations, prefer file_path for files on disk so callers do not need
+    to load full file contents into their context.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        file_name (str): The name for the new Google Slides presentation (extension will be ignored).
+        file_path (Optional[str]): Local file path or file:// URL for any supported format (PPTX, PPT, ODP). Appropriate for larger files than content, but file_path may still load the file into memory or perform non-streaming reads. Avoid very large files that could exceed memory or time limits; use streaming/chunked uploads or an alternative API for huge files.
+        file_url (Optional[str]): Remote URL to fetch the presentation from (http/https).
+        source_format (Optional[str]): Source format hint ('pptx', 'ppt', 'odp').
+                                       Auto-detected from file_name extension if not provided.
+        folder_id (str): The ID of the parent folder. Defaults to 'root'.
+
+    Returns:
+        str: Confirmation message with the new Google Slides link.
+
+    Examples:
+        # Import a local PowerPoint file (preferred for batch operations)
+        import_to_google_slides(file_name="Deck", file_path="/path/to/deck.pptx")
+
+        # Import from URL
+        import_to_google_slides(file_name="Remote Deck", file_url="https://example.com/deck.pptx")
+    """
+    return await _import_with_conversion(
+        service,
+        tool_name="import_to_google_slides",
+        target_label="Google Slides presentation",
+        id_label="Presentation ID",
+        target_mime_type=GOOGLE_SLIDES_MIME_TYPE,
+        format_map=GOOGLE_SLIDES_IMPORT_FORMATS,
+        user_google_email=user_google_email,
+        file_name=file_name,
+        content=None,
+        file_path=file_path,
+        file_url=file_url,
+        source_format=source_format,
+        folder_id=folder_id,
+    )
+
+
+@server.tool()
+@handle_http_errors("import_to_google_sheets", service_type="drive")
+@require_google_service("drive", "drive_file")
+async def import_to_google_sheets(
+    service,
+    user_google_email: str,
+    file_name: str,
+    content: Optional[str] = None,
+    file_path: Optional[str] = None,
+    file_url: Optional[str] = None,
+    source_format: Optional[str] = None,
+    folder_id: str = "root",
+) -> str:
+    """
+    Imports a spreadsheet (XLSX, XLS, ODS, CSV, TSV) into Google Sheets format with automatic conversion.
+
+    Google Drive automatically converts the source spreadsheet to native Google Sheets format,
+    preserving rows, columns, sheets, and values.
+    For batch operations, prefer file_path for files on disk so callers do not need
+    to load full file contents into their context.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        file_name (str): The name for the new Google Sheets spreadsheet (extension will be ignored).
+        content (Optional[str]): Text content for text-based formats (CSV, TSV). Use only for short snippets or content already in memory.
+        file_path (Optional[str]): Local file path or file:// URL for any supported format (XLSX, XLS, ODS, CSV, TSV). Appropriate for larger files than content, but file_path may still load the file into memory or perform non-streaming reads. Avoid very large files that could exceed memory or time limits; use streaming/chunked uploads or an alternative API for huge files.
+        file_url (Optional[str]): Remote URL to fetch the spreadsheet from (http/https).
+        source_format (Optional[str]): Source format hint ('xlsx', 'xls', 'ods', 'csv', 'tsv').
+                                       Auto-detected from file_name extension if not provided.
+        folder_id (str): The ID of the parent folder. Defaults to 'root'.
+
+    Returns:
+        str: Confirmation message with the new Google Sheets link.
+
+    Examples:
+        # Import a local Excel file (preferred for batch operations)
+        import_to_google_sheets(file_name="Budget", file_path="/path/to/budget.xlsx")
+
+        # Import CSV content directly
+        import_to_google_sheets(file_name="Data.csv", content="a,b,c\\n1,2,3", source_format="csv")
+
+        # Import from URL
+        import_to_google_sheets(file_name="Remote Sheet", file_url="https://example.com/data.xlsx")
+    """
+    return await _import_with_conversion(
+        service,
+        tool_name="import_to_google_sheets",
+        target_label="Google Sheets spreadsheet",
+        id_label="Spreadsheet ID",
+        target_mime_type=GOOGLE_SHEETS_MIME_TYPE,
+        format_map=GOOGLE_SHEETS_IMPORT_FORMATS,
+        user_google_email=user_google_email,
+        file_name=file_name,
+        content=content,
+        file_path=file_path,
+        file_url=file_url,
+        source_format=source_format,
+        folder_id=folder_id,
+    )
+
+
