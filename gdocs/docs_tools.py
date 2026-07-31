@@ -7,6 +7,7 @@ This module provides MCP tools for interacting with Google Docs API and managing
 import logging
 import asyncio
 import io
+import re
 from typing import List, Dict, Any
 
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
@@ -27,6 +28,15 @@ from gdocs.docs_helpers import (
     create_insert_page_break_request,
     create_insert_image_request,
     create_bullet_list_request,
+    validate_suggestions_view_mode,
+)
+
+# Google Docs -> Markdown conversion
+from gdocs.docs_markdown import (
+    convert_doc_to_markdown,
+    parse_drive_comments,
+    format_comments_inline,
+    format_comments_appendix,
 )
 
 # Import document structure and table utilities
@@ -1424,3 +1434,132 @@ read_doc_comments = _comment_tools["read_comments"]
 create_doc_comment = _comment_tools["create_comment"]
 reply_to_comment = _comment_tools["reply_to_comment"]
 resolve_comment = _comment_tools["resolve_comment"]
+
+
+@server.tool()
+@handle_http_errors("get_doc_as_markdown", is_read_only=True, service_type="docs")
+@require_multiple_services(
+    [
+        {
+            "service_type": "drive",
+            "scopes": "drive_read",
+            "param_name": "drive_service",
+        },
+        {"service_type": "docs", "scopes": "docs_read", "param_name": "docs_service"},
+    ]
+)
+async def get_doc_as_markdown(
+    drive_service: Any,
+    docs_service: Any,
+    user_google_email: str,
+    document_id: str,
+    include_comments: bool = True,
+    comment_mode: str = "inline",
+    include_resolved: bool = False,
+    suggestions_view_mode: str = "DEFAULT_FOR_CURRENT_ACCESS",
+) -> str:
+    """
+    Reads a Google Doc and returns it as clean Markdown with optional comment context.
+
+    Unlike get_doc_content which returns plain text, this tool preserves document
+    formatting as Markdown: headings, bold/italic/strikethrough, links, code spans,
+    ordered/unordered lists with nesting, and tables.
+
+    When comments are included (the default), each comment's anchor text — the specific
+    text the comment was attached to — is preserved, giving full context for the discussion.
+
+    Args:
+        user_google_email: User's Google email address
+        document_id: ID of the Google Doc (or full URL)
+        include_comments: Whether to include comments (default: True)
+        comment_mode: How to display comments:
+            - "inline": Footnote-style references placed at the anchor text location (default)
+            - "appendix": All comments grouped at the bottom with blockquoted anchor text
+            - "none": No comments included
+        include_resolved: Whether to include resolved comments (default: False)
+        suggestions_view_mode: How to render suggestions in the returned content:
+            - "DEFAULT_FOR_CURRENT_ACCESS": Default based on user's access level
+            - "SUGGESTIONS_INLINE": Suggested changes appear inline in the document
+            - "PREVIEW_SUGGESTIONS_ACCEPTED": Preview as if all suggestions were accepted
+            - "PREVIEW_WITHOUT_SUGGESTIONS": Preview as if all suggestions were rejected
+
+    Returns:
+        str: The document content as Markdown, optionally with comments
+    """
+    # Extract doc ID from URL if a full URL was provided
+    url_match = re.search(r"/d/([\w-]+)", document_id)
+    if url_match:
+        document_id = url_match.group(1)
+
+    valid_modes = ("inline", "appendix", "none")
+    if comment_mode not in valid_modes:
+        return f"Error: comment_mode must be one of {valid_modes}, got '{comment_mode}'"
+
+    validation_error = validate_suggestions_view_mode(suggestions_view_mode)
+    if validation_error:
+        return validation_error
+
+    logger.info(
+        f"[get_doc_as_markdown] Doc={document_id}, comments={include_comments}, mode={comment_mode}"
+    )
+
+    # Fetch document content via Docs API (includeTabsContent for multi-tab docs)
+    try:
+        doc = await asyncio.wait_for(
+            asyncio.to_thread(
+                docs_service.documents()
+                .get(
+                    documentId=document_id,
+                    includeTabsContent=True,
+                    suggestionsViewMode=suggestions_view_mode,
+                )
+                .execute
+            ),
+            timeout=30,
+        )
+    except (TimeoutError, asyncio.TimeoutError):
+        return (
+            f"Error: Timed out fetching document {document_id} from Google Docs API. "
+            "The document may be too large or there may be a network issue. Please try again."
+        )
+
+    markdown = convert_doc_to_markdown(doc)
+
+    if not include_comments or comment_mode == "none":
+        return markdown
+
+    # Fetch comments via Drive API
+    all_comments = []
+    page_token = None
+
+    while True:
+        response = await asyncio.to_thread(
+            drive_service.comments()
+            .list(
+                fileId=document_id,
+                fields="comments(id,content,author,createdTime,modifiedTime,"
+                "resolved,quotedFileContent,"
+                "replies(id,content,author,createdTime,modifiedTime)),"
+                "nextPageToken",
+                includeDeleted=False,
+                pageToken=page_token,
+            )
+            .execute
+        )
+        all_comments.extend(response.get("comments", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+    comments = parse_drive_comments(
+        {"comments": all_comments}, include_resolved=include_resolved
+    )
+
+    if not comments:
+        return markdown
+
+    if comment_mode == "inline":
+        return format_comments_inline(markdown, comments)
+    else:
+        appendix = format_comments_appendix(comments)
+        return markdown.rstrip("\n") + "\n\n" + appendix
