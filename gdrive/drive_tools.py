@@ -30,6 +30,7 @@ from gdrive.drive_helpers import (
     build_drive_list_params,
     check_public_link_permission,
     format_permission_info,
+    FOLDER_MIME_TYPE,
     get_drive_image_url,
     resolve_drive_item,
     resolve_folder_id,
@@ -443,6 +444,52 @@ async def list_drive_items(
         )
     text_output = "\n".join(formatted_items_text_parts)
     return text_output
+
+
+@server.tool()
+@handle_http_errors("create_drive_folder", service_type="drive")
+@require_google_service("drive", "drive_file")
+async def create_drive_folder(
+    service,
+    user_google_email: str,
+    folder_name: str,
+    parent_folder_id: str = "root",
+) -> str:
+    """
+    Creates a new folder in Google Drive, supporting creation within shared drives.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        folder_name (str): The name for the new folder.
+        parent_folder_id (str): The ID of the parent folder. Defaults to 'root'.
+            For shared drives, use a folder ID within that shared drive.
+
+    Returns:
+        str: Confirmation message with folder name, ID, and link.
+    """
+    logger.info(
+        f"[create_drive_folder] Invoked. Email: '{user_google_email}', Folder: '{folder_name}', Parent: '{parent_folder_id}'"
+    )
+    resolved_folder_id = await resolve_folder_id(service, parent_folder_id)
+    file_metadata = {
+        "name": folder_name,
+        "parents": [resolved_folder_id],
+        "mimeType": FOLDER_MIME_TYPE,
+    }
+    created_file = await asyncio.to_thread(
+        service.files()
+        .create(
+            body=file_metadata,
+            fields="id, name, webViewLink",
+            supportsAllDrives=True,
+        )
+        .execute
+    )
+    link = created_file.get("webViewLink", "")
+    return (
+        f"Successfully created folder '{created_file.get('name', folder_name)}' (ID: {created_file.get('id', 'N/A')}) "
+        f"in folder '{parent_folder_id}' for {user_google_email}. Link: {link}"
+    )
 
 
 @server.tool()
