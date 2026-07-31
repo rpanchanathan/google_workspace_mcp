@@ -405,13 +405,16 @@ class OAuth21SessionStore:
                 return None
 
     def get_credentials_by_mcp_session(
-        self, mcp_session_id: str
+        self, mcp_session_id: str, expected_user_email: Optional[str] = None
     ) -> Optional[Credentials]:
         """
         Get Google credentials using FastMCP session ID.
 
         Args:
             mcp_session_id: FastMCP session ID
+            expected_user_email: If given, only return credentials when the session is
+                bound to this user. Without it, the first account cached in a session is
+                returned for every subsequent request regardless of who was asked for.
 
         Returns:
             Google Credentials object or None
@@ -421,6 +424,16 @@ class OAuth21SessionStore:
             user_email = self._mcp_session_mapping.get(mcp_session_id)
             if not user_email:
                 logger.debug(f"No user mapping found for MCP session {mcp_session_id}")
+                return None
+
+            if (
+                expected_user_email
+                and user_email.lower() != expected_user_email.lower()
+            ):
+                logger.debug(
+                    f"MCP session {mcp_session_id} is bound to {user_email}, but "
+                    f"{expected_user_email} was requested. Ignoring session cache."
+                )
                 return None
 
             logger.debug(f"Found user {user_email} for MCP session {mcp_session_id}")

@@ -188,10 +188,16 @@ def save_credentials_to_session(session_id: str, credentials: Credentials):
         )
 
 
-def load_credentials_from_session(session_id: str) -> Optional[Credentials]:
-    """Loads user credentials from OAuth21SessionStore."""
+def load_credentials_from_session(
+    session_id: str, expected_user_email: Optional[str] = None
+) -> Optional[Credentials]:
+    """Loads user credentials from OAuth21SessionStore.
+
+    When expected_user_email is given, credentials bound to a different account are
+    ignored so the caller falls through to that account's own credential file.
+    """
     store = get_oauth21_session_store()
-    credentials = store.get_credentials_by_mcp_session(session_id)
+    credentials = store.get_credentials_by_mcp_session(session_id, expected_user_email)
     if credentials:
         logger.debug(
             f"Credentials loaded from OAuth21SessionStore for session_id: {session_id}"
@@ -591,7 +597,9 @@ def get_credentials(
             store = get_oauth21_session_store()
 
             # Try to get credentials by MCP session
-            credentials = store.get_credentials_by_mcp_session(session_id)
+            credentials = store.get_credentials_by_mcp_session(
+                session_id, user_google_email
+            )
             if credentials:
                 logger.info(
                     f"[get_credentials] Found OAuth 2.1 credentials for MCP session {session_id}"
@@ -674,7 +682,7 @@ def get_credentials(
         )
 
         if session_id:
-            credentials = load_credentials_from_session(session_id)
+            credentials = load_credentials_from_session(session_id, user_google_email)
             if credentials:
                 logger.debug(
                     f"[get_credentials] Loaded credentials from session for session_id '{session_id}'."
