@@ -6,8 +6,11 @@ This module provides MCP tools for interacting with Google Forms API.
 
 import logging
 import asyncio
-from typing import Optional, Dict, Any, List
+import json
+from typing import List, Optional, Dict, Any
 
+
+from mcp.types import ToolAnnotations
 
 from auth.service_decorator import require_google_service
 from core.server import server
@@ -16,7 +19,114 @@ from core.utils import handle_http_errors
 logger = logging.getLogger(__name__)
 
 
-@server.tool()
+def _extract_option_values(options: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Extract valid option objects from Forms choice option objects.
+
+    Returns the full option dicts (preserving fields like ``isOther``,
+    ``image``, ``goToAction``, and ``goToSectionId``) while filtering
+    out entries that lack a truthy ``value``.
+    """
+    return [option for option in options if option.get("value")]
+
+
+def _get_question_type(question: Dict[str, Any]) -> str:
+    """Infer a stable question/item type label from a Forms question payload."""
+    choice_question = question.get("choiceQuestion")
+    if choice_question:
+        return choice_question.get("type", "CHOICE")
+
+    text_question = question.get("textQuestion")
+    if text_question:
+        return "PARAGRAPH" if text_question.get("paragraph") else "TEXT"
+
+    if "rowQuestion" in question:
+        return "GRID_ROW"
+    if "scaleQuestion" in question:
+        return "SCALE"
+    if "dateQuestion" in question:
+        return "DATE"
+    if "timeQuestion" in question:
+        return "TIME"
+    if "fileUploadQuestion" in question:
+        return "FILE_UPLOAD"
+    if "ratingQuestion" in question:
+        return "RATING"
+
+    return "QUESTION"
+
+
+def _serialize_form_item(item: Dict[str, Any], index: int) -> Dict[str, Any]:
+    """Serialize a Forms item with the key metadata agents need for edits."""
+    serialized_item: Dict[str, Any] = {
+        "index": index,
+        "itemId": item.get("itemId"),
+        "title": item.get("title", f"Question {index}"),
+    }
+
+    if item.get("description"):
+        serialized_item["description"] = item["description"]
+
+    if "questionItem" in item:
+        question = item.get("questionItem", {}).get("question", {})
+        serialized_item["type"] = _get_question_type(question)
+        serialized_item["required"] = question.get("required", False)
+
+        question_id = question.get("questionId")
+        if question_id:
+            serialized_item["questionId"] = question_id
+
+        choice_question = question.get("choiceQuestion")
+        if choice_question:
+            serialized_item["options"] = _extract_option_values(
+                choice_question.get("options", [])
+            )
+
+        return serialized_item
+
+    if "questionGroupItem" in item:
+        question_group = item.get("questionGroupItem", {})
+        columns = _extract_option_values(
+            question_group.get("grid", {}).get("columns", {}).get("options", [])
+        )
+
+        rows = []
+        for question in question_group.get("questions", []):
+            row: Dict[str, Any] = {
+                "title": question.get("rowQuestion", {}).get("title", "")
+            }
+            row_question_id = question.get("questionId")
+            if row_question_id:
+                row["questionId"] = row_question_id
+            row["required"] = question.get("required", False)
+            rows.append(row)
+
+        serialized_item["type"] = "GRID"
+        serialized_item["grid"] = {"rows": rows, "columns": columns}
+        return serialized_item
+
+    if "pageBreakItem" in item:
+        serialized_item["type"] = "PAGE_BREAK"
+    elif "textItem" in item:
+        serialized_item["type"] = "TEXT_ITEM"
+    elif "imageItem" in item:
+        serialized_item["type"] = "IMAGE"
+    elif "videoItem" in item:
+        serialized_item["type"] = "VIDEO"
+    else:
+        serialized_item["type"] = "UNKNOWN"
+
+    return serialized_item
+
+
+@server.tool(
+    title="Create Form",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("create_form", service_type="forms")
 @require_google_service("forms", "forms")
 async def create_form(
@@ -63,7 +173,15 @@ async def create_form(
     return confirmation_message
 
 
-@server.tool()
+@server.tool(
+    title="Get Form",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("get_form", is_read_only=True, service_type="forms")
 @require_google_service("forms", "forms")
 async def get_form(service, user_google_email: str, form_id: str) -> str:
@@ -92,18 +210,24 @@ async def get_form(service, user_google_email: str, form_id: str) -> str:
     )
 
     items = form.get("items", [])
-    questions_summary = []
-    for i, item in enumerate(items, 1):
-        item_title = item.get("title", f"Question {i}")
-        item_type = (
-            item.get("questionItem", {}).get("question", {}).get("required", False)
-        )
-        required_text = " (Required)" if item_type else ""
-        questions_summary.append(f"  {i}. {item_title}{required_text}")
+    serialized_items = [
+        _serialize_form_item(item, i) for i, item in enumerate(items, 1)
+    ]
 
-    questions_text = (
-        "\n".join(questions_summary) if questions_summary else "  No questions found"
+    items_summary = []
+    for serialized_item in serialized_items:
+        item_index = serialized_item["index"]
+        item_title = serialized_item.get("title", f"Item {item_index}")
+        item_type = serialized_item.get("type", "UNKNOWN")
+        required_text = " (Required)" if serialized_item.get("required") else ""
+        items_summary.append(
+            f"  {item_index}. {item_title} [{item_type}]{required_text}"
+        )
+
+    items_summary_text = (
+        "\n".join(items_summary) if items_summary else "  No items found"
     )
+    items_text = json.dumps(serialized_items, indent=2) if serialized_items else "[]"
 
     result = f"""Form Details for {user_google_email}:
 - Title: "{title}"
@@ -112,22 +236,32 @@ async def get_form(service, user_google_email: str, form_id: str) -> str:
 - Form ID: {form_id}
 - Edit URL: {edit_url}
 - Responder URL: {responder_url}
-- Questions ({len(items)} total):
-{questions_text}"""
+- Items ({len(items)} total):
+{items_summary_text}
+- Items (structured):
+{items_text}"""
 
     logger.info(f"Successfully retrieved form for {user_google_email}. ID: {form_id}")
     return result
 
 
-@server.tool()
+@server.tool(
+    title="Set Publish Settings",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("set_publish_settings", service_type="forms")
 @require_google_service("forms", "forms")
 async def set_publish_settings(
     service,
     user_google_email: str,
     form_id: str,
-    publish_as_template: bool = False,
-    require_authentication: bool = False,
+    is_published: bool = True,
+    is_accepting_responses: bool = True,
 ) -> str:
     """
     Updates the publish settings of a form.
@@ -135,8 +269,8 @@ async def set_publish_settings(
     Args:
         user_google_email (str): The user's Google email address. Required.
         form_id (str): The ID of the form to update publish settings for.
-        publish_as_template (bool): Whether to publish as a template. Defaults to False.
-        require_authentication (bool): Whether to require authentication to view/submit. Defaults to False.
+        is_published (bool): Whether the form is published and visible to responders. Defaults to True.
+        is_accepting_responses (bool): Whether the form accepts responses. Only takes effect when the form is published. Defaults to True.
 
     Returns:
         str: Confirmation message of the successful publish settings update.
@@ -146,22 +280,35 @@ async def set_publish_settings(
     )
 
     settings_body = {
-        "publishAsTemplate": publish_as_template,
-        "requireAuthentication": require_authentication,
+        "publishSettings": {
+            "publishState": {
+                "isPublished": is_published,
+                "isAcceptingResponses": is_accepting_responses,
+            }
+        },
+        "updateMask": "publishState",
     }
 
     await asyncio.to_thread(
         service.forms().setPublishSettings(formId=form_id, body=settings_body).execute
     )
 
-    confirmation_message = f"Successfully updated publish settings for form {form_id} for {user_google_email}. Publish as template: {publish_as_template}, Require authentication: {require_authentication}"
+    confirmation_message = f"Successfully updated publish settings for form {form_id} for {user_google_email}. Published: {is_published}, Accepting responses: {is_accepting_responses}"
     logger.info(
         f"Publish settings updated successfully for {user_google_email}. Form ID: {form_id}"
     )
     return confirmation_message
 
 
-@server.tool()
+@server.tool(
+    title="Get Form Response",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("get_form_response", is_read_only=True, service_type="forms")
 @require_google_service("forms", "forms")
 async def get_form_response(
@@ -216,7 +363,15 @@ async def get_form_response(
     return result
 
 
-@server.tool()
+@server.tool(
+    title="List Form Responses",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
 @handle_http_errors("list_form_responses", is_read_only=True, service_type="forms")
 @require_google_service("forms", "forms")
 async def list_form_responses(
@@ -285,92 +440,103 @@ async def list_form_responses(
     return result
 
 
-@server.tool()
-@handle_http_errors("batch_get_form_responses", is_read_only=True, service_type="forms")
-@require_google_service("forms", "forms_responses_read")
-async def batch_get_form_responses(
+# Internal implementation function for testing
+async def _batch_update_form_impl(
+    service: Any,
+    form_id: str,
+    requests: List[Dict[str, Any]],
+) -> str:
+    """Internal implementation for batch_update_form.
+
+    Applies batch updates to a Google Form using the Forms API batchUpdate method.
+
+    Args:
+        service: Google Forms API service client.
+        form_id: The ID of the form to update.
+        requests: List of update request dictionaries.
+
+    Returns:
+        Formatted string with batch update results.
+    """
+    body = {"requests": requests}
+
+    result = await asyncio.to_thread(
+        service.forms().batchUpdate(formId=form_id, body=body).execute
+    )
+
+    replies = result.get("replies", [])
+
+    confirmation_message = f"""Batch Update Completed:
+- Form ID: {form_id}
+- URL: https://docs.google.com/forms/d/{form_id}/edit
+- Requests Applied: {len(requests)}
+- Replies Received: {len(replies)}"""
+
+    if replies:
+        confirmation_message += "\n\nUpdate Results:"
+        for i, reply in enumerate(replies, 1):
+            if "createItem" in reply:
+                item_id = reply["createItem"].get("itemId", "Unknown")
+                question_ids = reply["createItem"].get("questionId", [])
+                question_info = (
+                    f" (Question IDs: {', '.join(question_ids)})"
+                    if question_ids
+                    else ""
+                )
+                confirmation_message += (
+                    f"\n  Request {i}: Created item {item_id}{question_info}"
+                )
+            else:
+                confirmation_message += f"\n  Request {i}: Operation completed"
+
+    return confirmation_message
+
+
+@server.tool(
+    title="Batch Update Form",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("batch_update_form", service_type="forms")
+@require_google_service("forms", "forms")
+async def batch_update_form(
     service,
     user_google_email: str,
-    form_ids: List[str],
-    max_responses_per_form: int = 10,
+    form_id: str,
+    requests: List[Dict[str, Any]],
 ) -> str:
     """
-    Get responses from multiple Google Forms in batch.
+    Apply batch updates to a Google Form.
+
+    Supports adding, updating, and deleting form items, as well as updating
+    form metadata and settings. This is the primary method for modifying form
+    content after creation.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
-        form_ids (List[str]): List of form IDs to retrieve responses from (max 10).
-        max_responses_per_form (int): Maximum responses to retrieve per form (default 10).
+        form_id (str): The ID of the form to update.
+        requests (List[Dict[str, Any]]): List of update requests to apply.
+            Supported request types:
+            - createItem: Add a new question or content item
+            - updateItem: Modify an existing item
+            - deleteItem: Remove an item
+            - moveItem: Reorder an item
+            - updateFormInfo: Update form title/description
+            - updateSettings: Modify form settings (e.g., quiz mode)
 
     Returns:
-        str: Summary of responses from all forms.
+        str: Details about the batch update operation results.
     """
     logger.info(
-        f"[batch_get_form_responses] Email: '{user_google_email}', "
-        f"Form count: {len(form_ids)}, Max per form: {max_responses_per_form}"
+        f"[batch_update_form] Invoked. Email: '{user_google_email}', "
+        f"Form ID: '{form_id}', Requests: {len(requests)}"
     )
 
-    if len(form_ids) > 10:
-        return "Error: Maximum 10 forms per batch operation"
+    result = await _batch_update_form_impl(service, form_id, requests)
 
-    if not form_ids:
-        return "No forms to retrieve responses from"
-
-    results = []
-    for form_id in form_ids:
-        try:
-            # Get form metadata
-            form = await asyncio.to_thread(
-                service.forms().get(formId=form_id).execute
-            )
-
-            form_title = form.get("info", {}).get("title", "Untitled Form")
-
-            # Get responses
-            response_list = await asyncio.to_thread(
-                service.forms()
-                .responses()
-                .list(formId=form_id, pageSize=max_responses_per_form)
-                .execute
-            )
-
-            responses = response_list.get("responses", [])
-
-            results.append({
-                "form_id": form_id,
-                "title": form_title,
-                "response_count": len(responses),
-                "responses": responses[:max_responses_per_form]
-            })
-
-        except Exception as e:
-            results.append({
-                "form_id": form_id,
-                "error": str(e)
-            })
-
-    # Format output
-    output_lines = [f"Retrieved responses from {len(results)} forms:\n"]
-
-    for result in results:
-        if "error" in result:
-            output_lines.append(
-                f"\n❌ Form {result['form_id']}: Error - {result['error']}"
-            )
-        else:
-            output_lines.append(
-                f"\n✓ {result['title']} (ID: {result['form_id']})\n"
-                f"  Total responses: {result['response_count']}\n"
-            )
-
-            for i, response in enumerate(result.get("responses", []), 1):
-                response_id = response.get("responseId", "Unknown")
-                create_time = response.get("createTime", "Unknown")
-                answers_count = len(response.get("answers", {}))
-
-                output_lines.append(
-                    f"  {i}. Response ID: {response_id} | "
-                    f"Created: {create_time} | Answers: {answers_count}\n"
-                )
-
-    return "".join(output_lines)
+    logger.info(f"Batch update completed successfully for {user_google_email}")
+    return result

@@ -1,27 +1,106 @@
+import base64
 import io
+import json
 import logging
 import os
-import random
-import re
+import tempfile
 import zipfile
-import xml.etree.ElementTree as ET
 import ssl
 import asyncio
 import functools
 
 from pathlib import Path
-from typing import List, Optional, Any, Dict
+from typing import Annotated, Any, List, Optional
 
+from pydantic import BeforeValidator
+from defusedxml import ElementTree as ET
+
+from fastmcp.exceptions import ToolError
 from googleapiclient.errors import HttpError
 from .api_enablement import get_api_enablement_message
 from auth.google_auth import GoogleAuthenticationError
+from auth.oauth_config import is_oauth21_enabled, is_external_oauth21_provider
 
 logger = logging.getLogger(__name__)
 
-# Number of retries for Google API write calls (upload/create).
 GOOGLE_API_WRITE_RETRIES = 3
 
 
+class TransientNetworkError(Exception):
+    """Custom exception for transient network errors after retries."""
+
+    pass
+
+
+class UserInputError(Exception):
+    """Raised for user-facing input/validation errors that shouldn't be retried."""
+
+    pass
+
+
+def _coerce_json_str_to_type(v: Any, expected_type: type) -> Any:
+    """Coerce a JSON-encoded string to a specific container type."""
+    if not isinstance(v, str):
+        return v
+
+    try:
+        parsed = json.loads(v)
+    except (json.JSONDecodeError, TypeError):
+        return v
+
+    return parsed if isinstance(parsed, expected_type) else v
+
+
+def _coerce_json_str_to_list(v: Any) -> Any:
+    """Coerce a JSON-encoded string to a list.
+
+    Some MCP clients (e.g. Cowork) serialise array parameters as JSON strings
+    rather than native arrays.  This ``BeforeValidator`` transparently converts
+    ``'["a","b"]'`` → ``["a", "b"]`` so Pydantic validation succeeds.
+    """
+    return _coerce_json_str_to_type(v, list)
+
+
+StringList = Annotated[List[str], BeforeValidator(_coerce_json_str_to_list)]
+"""``List[str]`` that also accepts a JSON-encoded string of an array.
+
+Use in tool signatures instead of ``List[str]`` to work around MCP clients
+that send ``'["value"]'`` instead of ``["value"]``.
+"""
+
+
+DictList = Annotated[List[dict[str, Any]], BeforeValidator(_coerce_json_str_to_list)]
+"""``List[dict]`` that also accepts a JSON-encoded string of an array.
+
+Use in tool signatures instead of ``List[dict]`` to work around MCP clients
+that send ``'[{"key":"val"}]'`` instead of ``[{"key":"val"}]``.
+"""
+
+
+ObjectList = Annotated[List[object], BeforeValidator(_coerce_json_str_to_list)]
+"""``List[object]`` that also accepts a JSON-encoded string of an array."""
+
+
+def _coerce_json_str_to_dict(v: Any) -> Any:
+    """Coerce a JSON-encoded string to a dict.
+
+    Some MCP clients serialise dict parameters as JSON strings rather than
+    native objects.  This ``BeforeValidator`` transparently converts
+    ``'{"key":"val"}'`` -> ``{"key": "val"}`` so Pydantic validation succeeds.
+    """
+    return _coerce_json_str_to_type(v, dict)
+
+
+JsonDict = Annotated[dict[str, Any], BeforeValidator(_coerce_json_str_to_dict)]
+"""``dict`` that also accepts a JSON-encoded string of an object.
+
+Use in tool signatures instead of ``Dict[str, Any]`` to work around MCP clients
+that send ``'{"key":"val"}'`` instead of ``{"key": "val"}``.
+"""
+
+
+# Directories from which local file reads are allowed.
+# By default, only the managed attachment storage directory is trusted.
 # Override via ALLOWED_FILE_DIRS env var (os.pathsep-separated paths).
 _ALLOWED_FILE_DIRS_ENV = "ALLOWED_FILE_DIRS"
 
@@ -166,42 +245,6 @@ def validate_file_path(file_path: str) -> Path:
     )
 
 
-def redact_sensitive_data(data: Any) -> Any:
-    """Redact sensitive fields from data before logging.
-
-    Args:
-        data: Data to redact (dict, string, or other type)
-
-    Returns:
-        Redacted data with sensitive values replaced
-    """
-    if isinstance(data, dict):
-        sensitive_keys = {'refresh_token', 'access_token', 'client_secret', 'token', 'id_token'}
-        return {
-            k: '***REDACTED***' if k in sensitive_keys else redact_sensitive_data(v)
-            for k, v in data.items()
-        }
-    elif isinstance(data, str):
-        # Redact anything that looks like a Google access token (ya29.*)
-        data = re.sub(r'(ya29\.[A-Za-z0-9_-]{50,})', '***ACCESS_TOKEN_REDACTED***', data)
-        # Redact anything that looks like a refresh token (long base64-ish strings)
-        data = re.sub(r'(1//[A-Za-z0-9_-]{50,})', '***REFRESH_TOKEN_REDACTED***', data)
-        return data
-    return data
-
-
-class TransientNetworkError(Exception):
-    """Custom exception for transient network errors after retries."""
-
-    pass
-
-
-class UserInputError(Exception):
-    """Raised for user-facing input/validation errors that shouldn't be retried."""
-
-    pass
-
-
 def check_credentials_directory_permissions(credentials_dir: str = None) -> None:
     """
     Check if the service has appropriate permissions to create and write to the .credentials directory.
@@ -218,58 +261,33 @@ def check_credentials_directory_permissions(credentials_dir: str = None) -> None
 
         credentials_dir = get_default_credentials_dir()
 
+    # Multiple server processes may initialize the same credentials directory at
+    # once. Keep the check idempotent: create the directory if needed, probe with
+    # a unique temporary file, and never remove the shared directory on failure.
     try:
-        # Check if directory exists
-        if os.path.exists(credentials_dir):
-            # Directory exists, check if we can write to it
-            test_file = os.path.join(credentials_dir, ".permission_test")
-            try:
-                with open(test_file, "w") as f:
-                    f.write("test")
-                os.remove(test_file)
-                logger.info(
-                    f"Credentials directory permissions check passed: {os.path.abspath(credentials_dir)}"
-                )
-            except (PermissionError, OSError) as e:
-                raise PermissionError(
-                    f"Cannot write to existing credentials directory '{os.path.abspath(credentials_dir)}': {e}"
-                )
-        else:
-            # Directory doesn't exist, try to create it and its parent directories
-            try:
-                os.makedirs(credentials_dir, exist_ok=True)
-                # Test writing to the new directory
-                test_file = os.path.join(credentials_dir, ".permission_test")
-                with open(test_file, "w") as f:
-                    f.write("test")
-                os.remove(test_file)
-                logger.info(
-                    f"Created credentials directory with proper permissions: {os.path.abspath(credentials_dir)}"
-                )
-            except (PermissionError, OSError) as e:
-                # Clean up if we created the directory but can't write to it
-                try:
-                    if os.path.exists(credentials_dir):
-                        os.rmdir(credentials_dir)
-                except (PermissionError, OSError):
-                    pass
-                raise PermissionError(
-                    f"Cannot create or write to credentials directory '{os.path.abspath(credentials_dir)}': {e}"
-                )
-
-    except PermissionError:
-        raise
-    except Exception as e:
-        raise OSError(
-            f"Unexpected error checking credentials directory permissions: {e}"
+        os.makedirs(credentials_dir, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            dir=credentials_dir, prefix=".permission_test_"
+        ) as probe:
+            probe.write(b"test")
+            probe.flush()
+    except (PermissionError, OSError) as e:
+        raise PermissionError(
+            f"Cannot create or write to credentials directory "
+            f"'{os.path.abspath(credentials_dir)}': {e}"
         )
+
+    # Debug level: the startup screen already reports this check and the path.
+    logger.debug(
+        f"Credentials directory permissions check passed: {os.path.abspath(credentials_dir)}"
+    )
 
 
 def extract_office_xml_text(file_bytes: bytes, mime_type: str) -> Optional[str]:
     """
     Very light-weight XML scraper for Word, Excel, PowerPoint files.
     Returns plain-text if something readable is found, else None.
-    No external deps – just std-lib zipfile + ElementTree.
+    Uses zipfile + defusedxml.ElementTree.
     """
     shared_strings: List[str] = []
     ns_excel_main = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -415,6 +433,62 @@ def extract_office_xml_text(file_bytes: bytes, mime_type: str) -> Optional[str]:
         return None
 
 
+IMAGE_MIME_TYPES = {
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "image/bmp",
+    "image/tiff",
+    "image/svg+xml",
+}
+
+
+def extract_pdf_text(file_bytes: bytes) -> Optional[str]:
+    """
+    Extract text from a PDF using pypdf.
+    Returns plain text with pages separated by double newlines, or None on failure.
+    """
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(io.BytesIO(file_bytes))
+        pages = []
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                pages.append(text)
+        if not pages:
+            return None
+        return "\n\n".join(pages).strip() or None
+    except Exception as e:
+        logger.warning(f"Failed to extract PDF text: {e}")
+        return None
+
+
+def encode_image_content(file_bytes: bytes, mime_type: str) -> str:
+    """
+    Base64-encode image bytes with a mime type metadata prefix.
+
+    Args:
+        file_bytes: The image file content as bytes.
+        mime_type: The MIME type of the image (must start with "image/").
+
+    Returns:
+        str: Base64-encoded image with mime type prefix.
+
+    Raises:
+        ValueError: If mime_type is not an image MIME type.
+    """
+    if not mime_type.startswith("image/"):
+        raise ValueError(
+            f"Expected image/* MIME type, got '{mime_type}'. "
+            "Only image content can be base64-encoded for multimodal clients."
+        )
+    encoded = base64.b64encode(file_bytes).decode("ascii")
+    return f"[base64_image:{mime_type}]{encoded}"
+
+
 def handle_http_errors(
     tool_name: str, is_read_only: bool = False, service_type: Optional[str] = None
 ):
@@ -466,31 +540,6 @@ def handle_http_errors(
                     user_google_email = kwargs.get("user_google_email", "N/A")
                     error_details = str(error)
 
-                    # Check for rate limit (429) - retry with backoff
-                    if error.resp.status == 429 and attempt < max_retries - 1:
-                        retry_after = error.resp.headers.get('Retry-After', None)
-                        if retry_after:
-                            try:
-                                wait_time = int(retry_after)
-                            except ValueError:
-                                wait_time = (2 ** attempt) + random.uniform(0, 1)
-                        else:
-                            wait_time = (2 ** attempt) + random.uniform(0, 1)
-                        logger.warning(
-                            f"Rate limited (429) in {tool_name}. Waiting {wait_time:.1f}s before retry {attempt + 1}/{max_retries}"
-                        )
-                        await asyncio.sleep(wait_time)
-                        continue
-                    elif error.resp.status == 429:
-                        # Final attempt failed with rate limit
-                        logger.error(
-                            f"Rate limit (429) in {tool_name} after {max_retries} attempts"
-                        )
-                        raise TransientNetworkError(
-                            f"Rate limit exceeded in '{tool_name}' after {max_retries} attempts. "
-                            "Please try again later."
-                        ) from error
-
                     # Check if this is an API not enabled error
                     if (
                         error.resp.status == 403
@@ -513,10 +562,26 @@ def handle_http_errors(
                             )
                     elif error.resp.status in [401, 403]:
                         # Authentication/authorization errors
+                        if is_oauth21_enabled():
+                            if is_external_oauth21_provider():
+                                auth_hint = (
+                                    "LLM: Ask the user to provide a valid OAuth 2.1 "
+                                    "bearer token in the Authorization header and retry."
+                                )
+                            else:
+                                auth_hint = (
+                                    "LLM: Ask the user to authenticate via their MCP "
+                                    "client's OAuth 2.1 flow and retry."
+                                )
+                        else:
+                            auth_hint = (
+                                "LLM: Try 'start_google_auth' with the user's email "
+                                "and the appropriate service_name."
+                            )
                         message = (
                             f"API error in {tool_name}: {error}. "
                             f"You might need to re-authenticate for user '{user_google_email}'. "
-                            f"LLM: Try 'start_google_auth' with the user's email and the appropriate service_name."
+                            f"{auth_hint}"
                         )
                     else:
                         # Other HTTP errors (400 Bad Request, etc.) - don't suggest re-auth
@@ -527,6 +592,9 @@ def handle_http_errors(
                 except TransientNetworkError:
                     # Re-raise without wrapping to preserve the specific error type
                     raise
+                except ToolError:
+                    # Re-raise explicit tool errors so FastMCP can surface them directly.
+                    raise
                 except GoogleAuthenticationError:
                     # Re-raise authentication errors without wrapping
                     raise
@@ -534,6 +602,10 @@ def handle_http_errors(
                     message = f"An unexpected error occurred in {tool_name}: {e}"
                     logger.exception(message)
                     raise Exception(message) from e
+
+        # Propagate _required_google_scopes if present (for tool filtering)
+        if hasattr(func, "_required_google_scopes"):
+            wrapper._required_google_scopes = func._required_google_scopes
 
         return wrapper
 
