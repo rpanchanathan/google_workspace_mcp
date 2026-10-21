@@ -569,6 +569,11 @@ async def _fetch_raw_message_contents(
     return raw_contents
 
 
+def _plain_to_html(body: str) -> str:
+    """Render a plain-text body as HTML so an HTML signature can follow it intact."""
+    return html.escape(body).replace("\r\n", "\n").replace("\n", "<br>")
+
+
 def _append_signature_to_body(
     body: str, body_format: Literal["plain", "html"], signature_html: str
 ) -> str:
@@ -2385,6 +2390,10 @@ async def send_gmail_message(
         signature_html = await _get_send_as_signature_html_for_tool(
             service, from_email=sender_email
         )
+        # Gmail signatures are HTML (often logo/icon images); flattening them to
+        # text leaves stray dots, so send as HTML whenever a signature is added.
+        if signature_html.strip() and body_format == "plain":
+            send_body_content, body_format = _plain_to_html(send_body_content), "html"
         send_body_content = _append_signature_to_body(
             send_body_content, body_format, signature_html
         )
@@ -2750,6 +2759,8 @@ async def draft_gmail_message(
         signature_html = await _get_send_as_signature_html_for_tool(
             service, from_email=sender_email
         )
+        if signature_html.strip() and body_format == "plain":
+            draft_body, body_format = _plain_to_html(draft_body), "html"
 
     reply_context = None
     if thread_id and (quote_original or not in_reply_to or not references or not to):
