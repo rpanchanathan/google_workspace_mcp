@@ -1232,11 +1232,12 @@ def get_credentials(
                         client_secret=credentials.client_secret,
                         scopes=credentials.scopes,
                         expiry=credentials.expiry,
-                        mcp_session_id=session_id,
+                        # A session bound to another account must not be rebound to this one
+                        mcp_session_id=None if skip_session_cache else session_id,
                         issuer="https://accounts.google.com",  # Add issuer for Google tokens
                     )
 
-            if session_id and (persist_succeeded or is_stateless_mode()):
+            if session_id and not skip_session_cache and (persist_succeeded or is_stateless_mode()):
                 # Update session cache if it was the source or is active
                 save_credentials_to_session(session_id, credentials)
         except RefreshError as e:

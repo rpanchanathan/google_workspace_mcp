@@ -145,3 +145,36 @@ def test_get_credentials_single_user_returns_none_for_missing_requested_user(
     assert credential_store.get_calls == ["missing@example.com"]
     assert credential_store.store_calls == []
     assert fallback_calls == []
+
+
+def test_get_credentials_refresh_does_not_rebind_other_users_session(monkeypatch):
+    file_creds = _RefreshableCredentials()
+    oauth_store = _OAuthSessionStore(session_user="first@example.com")
+    credential_store = _CredentialStore(existing_credentials=file_creds)
+    session_cache_writes = []
+
+    monkeypatch.delenv("MCP_SINGLE_USER_MODE", raising=False)
+    monkeypatch.setattr(
+        "auth.google_auth.get_oauth21_session_store", lambda: oauth_store
+    )
+    monkeypatch.setattr(
+        "auth.google_auth.get_credential_store", lambda: credential_store
+    )
+    monkeypatch.setattr("auth.google_auth.is_stateless_mode", lambda: False)
+    monkeypatch.setattr(
+        "auth.google_auth.has_required_scopes", lambda scopes, required: True
+    )
+    monkeypatch.setattr(
+        "auth.google_auth.save_credentials_to_session",
+        lambda *args: session_cache_writes.append(args),
+    )
+
+    result = get_credentials(
+        user_google_email="second@example.com",
+        required_scopes=["scope.a"],
+        session_id="session-1",
+    )
+
+    assert result is file_creds
+    assert oauth_store.store_calls[0]["mcp_session_id"] is None
+    assert session_cache_writes == []
