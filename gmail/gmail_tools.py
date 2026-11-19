@@ -574,6 +574,23 @@ def _plain_to_html(body: str) -> str:
     return html.escape(body).replace("\r\n", "\n").replace("\n", "<br>")
 
 
+_SIGN_OFF_RE = re.compile(
+    r"^(best|kind|warm|warmest)?\s*(regards|wishes)|^(thanks|thank you|many thanks|cheers|sincerely|yours)\b",
+    re.IGNORECASE,
+)
+
+
+def _body_signs_off(body: str) -> bool:
+    """True if one of the body's last four non-empty lines is a closing like 'Regards,'.
+
+    The Gmail signature carries its own sign-off, so appending it to such a body
+    gives the email two sign-offs.
+    """
+    text = re.sub(r"<[^>]+>", "\n", body or "")
+    lines = [ln.strip() for ln in html.unescape(text).splitlines() if ln.strip()]
+    return any(_SIGN_OFF_RE.match(ln) for ln in lines[-4:])
+
+
 def _append_signature_to_body(
     body: str, body_format: Literal["plain", "html"], signature_html: str
 ) -> str:
@@ -2386,6 +2403,8 @@ async def send_gmail_message(
     # Optionally append the Gmail signature from send-as settings, mirroring
     # draft_gmail_message so sent mail respects the user's Settings > Signature.
     send_body_content = body
+    if include_signature and _body_signs_off(body):
+        include_signature = False  # body already signs off; avoid a second sign-off
     if include_signature:
         signature_html = await _get_send_as_signature_html_for_tool(
             service, from_email=sender_email
@@ -2755,6 +2774,8 @@ async def draft_gmail_message(
     sender_email = from_email or user_google_email
     draft_body = body
     signature_html = ""
+    if include_signature and _body_signs_off(body):
+        include_signature = False  # body already signs off; avoid a second sign-off
     if include_signature:
         signature_html = await _get_send_as_signature_html_for_tool(
             service, from_email=sender_email
